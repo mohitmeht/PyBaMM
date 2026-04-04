@@ -22,6 +22,7 @@ from . import config
 # Classes for the Expression Tree
 from .expression_tree.symbol import *
 from .expression_tree.binary_operators import *
+from .expression_tree.tracing import is_tracing, tracing
 from .expression_tree.concatenations import *
 from .expression_tree.array import Array, linspace, meshgrid
 from .expression_tree.matrix import Matrix
@@ -30,6 +31,7 @@ from .expression_tree.averages import *
 from .expression_tree.averages import _BaseAverage
 from .expression_tree.broadcasts import *
 from .expression_tree.functions import *
+from .expression_tree.conditional import Conditional
 from .expression_tree.interpolant import Interpolant
 from .expression_tree.discrete_time_sum import *
 from .expression_tree.input_parameter import InputParameter
@@ -68,6 +70,9 @@ from .models.base_model import BaseModel, ModelSolutionObservability
 from .models.symbol_processor import SymbolProcessor
 from .models.event import Event
 from .models.event import EventType
+
+# DiffSL export
+from .expression_tree.operations.diffsl import DiffSLExport
 
 # Battery models
 from .models.full_battery_models.base_battery_model import (
@@ -208,7 +213,7 @@ from .plotting.plot_3d_cross_section import plot_3d_cross_section
 from .plotting.plot_3d_heatmap import plot_3d_heatmap
 
 # Simulation
-from .simulation import Simulation, load_sim, is_notebook
+from .simulation import BaseSimulation, Simulation, load_sim, is_notebook
 
 # Batch Study
 from .batch_study import BatchStudy
