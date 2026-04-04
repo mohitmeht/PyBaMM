@@ -1,13 +1,9 @@
 """
-Calendar Ageing Simulation Script for PyBaMM.
+Calendar Ageing Sensitivity Analysis for PyBaMM.
 
-This script runs calendar ageing simulations using the Doyle-Fuller-Newman (DFN) model
-with reaction-limited, solvent-diffusion limited, electron-migration limited, and
-interstitial-diffusion limited SEI growth models. It evaluates voltage loss across specified rest
-durations and Initial States of Charge (SOC), exporting results to a CSV and generating
-a comparative plot.
-
-Optimized for parallel execution using Python's concurrent.futures.
+This script runs calendar ageing simulations across the four major SEI models,
+testing their primary driving parameters at 0.1x, 1.0x, and 10.0x multipliers.
+Outputs results to CSV and generates a comparative visual plot.
 """
 
 import argparse
@@ -23,6 +19,14 @@ import numpy as np
 
 import pybamm as pb
 
+# Parameter mapping for each SEI model type
+MODEL_PARAMS = {
+    "reaction limited": "SEI kinetic rate constant [m.s-1]",
+    "solvent-diffusion limited": "SEI solvent diffusivity [m2.s-1]",
+    "electron-migration limited": "SEI electron conductivity [S.m-1]",
+    "interstitial-diffusion limited": "SEI lithium interstitial diffusivity [m2.s-1]",
+}
+
 
 def setup_logger(verbose: bool) -> logging.Logger:
     """Configure logging for the script."""
@@ -32,18 +36,18 @@ def setup_logger(verbose: bool) -> logging.Logger:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # PyBaMM's internal logging
     pb.set_logging_level("WARNING")
     return logging.getLogger(__name__)
 
 
 def run_simulation(
-    args: tuple[str, int, float],
+    args: tuple[str, float, int, float],
 ) -> tuple[
     str,
     float,
+    float,
+    float,
     int,
-    float | None,
     float | None,
     float | None,
     float | None,
@@ -52,35 +56,34 @@ def run_simulation(
     str | None,
 ]:
     """
-    Run a single calendar ageing simulation for a given SEI model, duration, and SOC.
-
-    Args:
-        args: A tuple containing (sei_model, days, initial_soc).
+    Run a calendar ageing simulation for a given SEI model, multiplier, duration, and SOC.
 
     Returns:
-        A tuple of (sei_model, initial_soc, days, voltage_before, voltage_after, delta_v, sei_thickness, lli, sei_rxn_rate, error_message).
+        A tuple of (sei_model, multiplier, actual_param_value, initial_soc, days, voltage_before, voltage_after, delta_v, sei_thickness, lli, error_message).
     """
-    sei_model, days, initial_soc = args
+    sei_model, param_multiplier, days, initial_soc = args
+    param_name = MODEL_PARAMS[sei_model]
+    actual_param_value = 0.0
+
     try:
-        # Create a new DFN model with reaction limited SEI
         model = pb.lithium_ion.DFN({"SEI": sei_model})
         parameter_values = model.default_parameter_values
 
-        # Set current to 0 for rest (calendar ageing)
         parameter_values["Current function [A]"] = 0
 
-        # Setup simulation
+        # Apply the exact sensitivity multiplier to the specific driving parameter
+        base_val = parameter_values[param_name]
+        actual_param_value = base_val * param_multiplier
+        parameter_values[param_name] = actual_param_value
+
         sim = pb.Simulation(model, parameter_values=parameter_values)
         solver = pb.IDAKLUSolver()
 
-        # Calculate time vector in seconds
         seconds = days * 24 * 60 * 60
         t_eval = np.linspace(0, seconds, 100)
 
-        # Solve with specific initial SOC
         sol = sim.solve(t_eval=t_eval, solver=solver, initial_soc=initial_soc)
 
-        # Extract voltage data
         voltage = sol["Voltage [V]"].entries
         voltage_before = float(voltage[0])
         voltage_after = float(voltage[-1])
@@ -89,13 +92,10 @@ def run_simulation(
         sei_thickness = float(sol["X-averaged negative SEI thickness [m]"].entries[-1])
         lli = float(sol["Loss of lithium inventory [%]"].entries[-1])
 
-        if sei_model == "reaction limited":
-            sei_rxn_rate = float(parameter_values["SEI kinetic rate constant [m.s-1]"])
-        else:
-            sei_rxn_rate = 0.0
-
         return (
             sei_model,
+            param_multiplier,
+            actual_param_value,
             initial_soc,
             days,
             voltage_before,
@@ -103,23 +103,36 @@ def run_simulation(
             delta_v,
             sei_thickness,
             lli,
-            sei_rxn_rate,
             None,
         )
     except Exception as e:
-        return sei_model, initial_soc, days, None, None, None, None, None, None, str(e)
+        return (
+            sei_model,
+            param_multiplier,
+            actual_param_value,
+            initial_soc,
+            days,
+            None,
+            None,
+            None,
+            None,
+            None,
+            str(e),
+        )
 
 
 def save_to_csv(
     csv_filename: Path, csv_rows: list[list[Any]], logger: logging.Logger
 ) -> None:
-    """Save simulation results to a CSV file."""
+    """Save simulation results to CSV."""
     try:
         with open(csv_filename, mode="w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
             writer.writerow(
                 [
                     "SEI Model",
+                    "Multiplier",
+                    "Param Value",
                     "Initial SOC",
                     "Days",
                     "Voltage Before (V)",
@@ -127,7 +140,6 @@ def save_to_csv(
                     "Delta V (V)",
                     "SEI Thickness (m)",
                     "Loss of Lithium Inventory (%)",
-                    "SEI rxn rate",
                 ]
             )
             writer.writerows(csv_rows)
@@ -140,38 +152,36 @@ def plot_results(
     plot_filename: Path,
     results_dict: dict[str, dict[float, dict[str, list[Any]]]],
     models_to_test: list[str],
-    socs_to_test: list[float],
+    multipliers: list[float],
     logger: logging.Logger,
 ) -> None:
     """Generate and save comparative plots of the results."""
-    _fig, axes = plt.subplots(1, max(1, len(socs_to_test)), figsize=(15, 6))
+    # 2x2 Grid for the four models
+    _fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
 
-    # Ensure axes is iterable even for 1 subplot
-    if len(socs_to_test) == 1:
-        axes = [axes]
-
-    for idx, soc in enumerate(socs_to_test):
+    for idx, model in enumerate(models_to_test):
         ax = axes[idx]
         plotted_any = False
-        for model in models_to_test:
-            if not results_dict[model][soc]["days"]:
+
+        for mult in multipliers:
+            if not results_dict[model][mult]["days"]:
                 logger.warning(
-                    f"No successful simulations to plot for {model} at SOC {soc:.0%}"
+                    f"No successful simulations to plot for {model} at {mult}x"
                 )
                 continue
 
-            # Convert delta_v to millivolts for better readability
-            delta_v_mv = [dv * 1000 for dv in results_dict[model][soc]["delta_v"]]
+            delta_v_mv = [dv * 1000 for dv in results_dict[model][mult]["delta_v"]]
             ax.plot(
-                results_dict[model][soc]["days"],
+                results_dict[model][mult]["days"],
                 delta_v_mv,
                 marker="o",
                 linestyle="-",
-                label=f"{model}",
+                label=f"{mult}x multiplier",
             )
             plotted_any = True
 
-        ax.set_title(f"Voltage Loss vs Rest Duration for {soc * 100:.0f}% SOC")
+        ax.set_title(f"Voltage Loss vs Days\n{model}\n({MODEL_PARAMS[model]})")
         ax.set_xlabel("Rest Duration (Days)")
         ax.set_ylabel("Voltage Loss (mV)")
         ax.grid(True, linestyle="--", alpha=0.7)
@@ -190,28 +200,18 @@ def plot_results(
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Run calendar ageing simulations in PyBaMM."
+        description="Run calendar ageing parameter sensitivity simulations."
     )
     parser.add_argument(
-        "--models",
-        nargs="+",
-        type=str,
-        default=[
-            "reaction limited",
-            "solvent-diffusion limited",
-            "electron-migration limited",
-            "interstitial-diffusion limited",
-        ],
-        help="List of SEI models to test",
-    )
-    parser.add_argument(
-        "--socs",
+        "--multipliers",
         nargs="+",
         type=float,
-        default=[0.3, 0.9],
-        help="List of Initial States of Charge to test (default: 0.3 0.9)",
+        default=[0.1, 1.0, 10.0],
+        help="List of multipliers to apply to the primary driving parameter corresponding to the SEI model",
+    )
+    parser.add_argument(
+        "--soc", type=float, default=0.9, help="Initial State of Charge (default: 0.9)"
     )
     parser.add_argument(
         "--min-days",
@@ -226,27 +226,20 @@ def parse_args() -> argparse.Namespace:
         help="Maximum rest duration in days (default: 80)",
     )
     parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=".",
-        help="Directory to save output files (default: current directory)",
+        "--output-dir", type=str, default=".", help="Directory to save output files"
     )
     parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging",
+        "-v", "--verbose", action="store_true", help="Enable verbose logging"
     )
     return parser.parse_args()
 
 
 def main() -> None:
-    """Main execution function."""
     args = parse_args()
     logger = setup_logger(args.verbose)
 
-    models_to_test: list[str] = args.models
-    socs_to_test: list[float] = args.socs
+    models_to_test = list(MODEL_PARAMS.keys())
+    multipliers: list[float] = args.multipliers
     day_range: list[int] = list(range(args.min_days, args.max_days + 1))
 
     output_dir = (
@@ -254,37 +247,38 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create an array of argument tuples for parallel execution
+    # Compile the matrix of parameter variations across all days and models
     simulation_args = [
-        (model, days, soc)
+        (model, mult, days, args.soc)
         for model in models_to_test
-        for soc in socs_to_test
+        for mult in multipliers
         for days in day_range
     ]
 
     logger.info(
-        f"Starting simulations for {len(models_to_test)} models, SOCs {socs_to_test} across {len(day_range)} "
-        f"durations ({args.min_days} to {args.max_days} days)..."
+        f"Starting sensitivity simulations across {len(models_to_test)} models and "
+        f"{len(multipliers)} parameter multipliers at {args.soc*100:.0f}% SOC..."
     )
     start_time = time.time()
 
+    # Dictionary Map format: results_dict[model][multiplier]["days"] = [...]
     results_dict: dict[str, dict[float, dict[str, list[Any]]]] = {
-        model: {soc: {"days": [], "delta_v": []} for soc in socs_to_test}
+        model: {mult: {"days": [], "delta_v": []} for mult in multipliers}
         for model in models_to_test
     }
     csv_rows: list[list[Any]] = []
 
-    # Process all combinations in parallel
     with concurrent.futures.ProcessPoolExecutor() as executor:
         results = list(executor.map(run_simulation, simulation_args))
 
     execution_time = time.time() - start_time
     logger.info(f"Total simulation execution time: {execution_time:.2f} seconds")
 
-    # Process results locally and populate data structures for CSV and Plotting
     for res in results:
         (
             model,
+            mult,
+            val,
             soc,
             days,
             v_before,
@@ -292,27 +286,26 @@ def main() -> None:
             d_v,
             sei_thickness,
             lli,
-            sei_rxn_rate,
             error,
         ) = res
         if error or v_before is None or v_after is None or d_v is None:
-            logger.error(
-                f"Error for Model {model} SOC {soc:.0%} at {days} days: {error}"
-            )
+            logger.error(f"Error for {model} at {mult}x on day {days}: {error}")
             continue
 
-        results_dict[model][soc]["days"].append(days)
-        results_dict[model][soc]["delta_v"].append(d_v)
+        results_dict[model][mult]["days"].append(days)
+        results_dict[model][mult]["delta_v"].append(d_v)
         csv_rows.append(
-            [model, soc, days, v_before, v_after, d_v, sei_thickness, lli, sei_rxn_rate]
+            [model, mult, val, soc, days, v_before, v_after, d_v, sei_thickness, lli]
         )
 
-    save_to_csv(output_dir / "calendar_ageing_results_models.csv", csv_rows, logger)
+    save_to_csv(
+        output_dir / "calendar_ageing_sensitivity_results.csv", csv_rows, logger
+    )
     plot_results(
-        output_dir / "calendar_ageing_models_plot.png",
+        output_dir / "calendar_ageing_sensitivity_plot.png",
         results_dict,
         models_to_test,
-        socs_to_test,
+        multipliers,
         logger,
     )
 

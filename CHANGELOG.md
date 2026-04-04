@@ -2,41 +2,30 @@
 
 ## Features
 
-- Added a unified experiment-model path that reuses a single built model and solver across compatible experiment steps. ([#5422](https://github.com/pybamm-team/PyBaMM/pull/5422))
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+- Reduced the time to build `Simulation`s by creating a post-processing step for variables. ([#5308](https://github.com/pybamm-team/PyBaMM/pull/5308))
+- Adds the ability to observe custom variables from a `Solution` object using `Solution.observe(symbol)`. ([#5308](https://github.com/pybamm-team/PyBaMM/pull/5308))
+- Added inverse kinetics for linear kinetics. ([#5303](https://github.com/pybamm-team/PyBaMM/pull/5303))
+>>>>>>> refs/remotes/origin/develop
+- Adds `silence_sundials_errors` IDAKLU solver option with `default=False` to match historical output. ([#5290](https://github.com/pybamm-team/PyBaMM/pull/5290))
 
 ## Bug fixes
 
-- Fixed serialisation bug in 2D finite volume discretisation. ([#5434](https://github.com/pybamm-team/PyBaMM/pull/5434))
-
-## Breaking changes
-
-# [v26.3.0](https://github.com/pybamm-team/PyBaMM/tree/v26.3.0) - 2026-03-23
-
-## Features
-
-- Improved the performance of processed variables by replacing `casadi.vertcat` input stacking with numpy vectors. ([#5413](https://github.com/pybamm-team/PyBaMM/pull/5413))
-- Preserve custom variables and events in built-in model to_config ([#5411](https://github.com/pybamm-team/PyBaMM/pull/5411))
-- Allow out of bounds initial state of charge to enable initialising a simulation at a voltage outside the voltage limits. ([#5386](https://github.com/pybamm-team/PyBaMM/pull/5386))
-- Added `cache_esoh` option to `Simulation` that caches the electrode SOH computation across repeated `solve` calls, avoiding redundant recalculation when eSOH-relevant parameters have not changed. The cached eSOH solver/simulation object is also reused on cache misses to skip expensive model rebuilding. ([#5408](https://github.com/pybamm-team/PyBaMM/pull/5408))
-- Eliminated the mass matrix inverse and temporary dense matrix objects when building the simulation. ([#5391](https://github.com/pybamm-team/PyBaMM/pull/5391))
-- Added the `hermite_reduction_factor` option to the `IDAKLUSolver`, which dynamically compresses solution size by removing redundant points in the Hermite interpolant. ([#5390](https://github.com/pybamm-team/PyBaMM/pull/5390))
+<<<<<<< HEAD
+=======
 - Added support for Python 3.14. ([#5374](https://github.com/pybamm-team/PyBaMM/pull/5374))
 - Added regularisation to the kinetics and OCPs so they are more numerically stable. ([#5371](https://github.com/pybamm-team/PyBaMM/pull/5371))
 - Improve the performance of matrix multiplication with CasADi expressions. ([#5351](https://github.com/pybamm-team/PyBaMM/pull/5351))
 - Adds option for lists of inputs to `solve` to include input parameters which are used
 as initial conditions. ([#5311](https://github.com/pybamm-team/PyBaMM/pull/5311))
-- DiffSL export for discretised PyBaMM models. ([#5370](https://github.com/pybamm-team/PyBaMM/pull/5370))
-- Optimize state mapper for multi-step experiments by pre-calculating mapper during setup. ([#5380](https://github.com/pybamm-team/PyBaMM/pull/5380))
 
 ## Bug fixes
 
-- Fixed a bug in the exchange current density calculation for MSMR models. ([#5404](https://github.com/pybamm-team/PyBaMM/pull/5404))
-- Fixed a bug where when converting `ExpressionFunctionParameter` to source code, `Interpolant` objects were being reduced to just their input variable names (e.g., sto) instead of preserving the full constructor call with data arrays. ([#5393](https://github.com/pybamm-team/PyBaMM/pull/5393))
-- Fixed a bug when using 2 phases with particle size distribution the bounds of the particle size distribution were always taken from the primary phase. ([#5415](https://github.com/pybamm-team/PyBaMM/pull/5415))
 
 ## Breaking changes
 
-- The mass matrix inverse is no longer computed during discretisation. Solvers instead use sparse linear solves. ([#5391](https://github.com/pybamm-team/PyBaMM/pull/5391))
 - Dropped JAX support on macOS with Intel (x86_64) processors. JAX dropped macOS Intel wheels in version 0.5.0, and the minimum JAX version has been bumped to >=0.7.0 for Python 3.14 compatibility. macOS users require Apple Silicon (M-series) for JAX features. ([#5374](https://github.com/pybamm-team/PyBaMM/pull/5374))
 - Added a small regularisation term to the exchange current density which slightly modifies the functional form of the kinetics as stoichiometry approaches 0 or 1. ([#5371](https://github.com/pybamm-team/PyBaMM/pull/5371))
 - The default OCP barrier as stoichiometry approaches 0 or 1 is now smooth instead of asymptotically approaching infinity. This may change the behavior of ESOH solvers in extreme stoichiometry limits. ([#5371](https://github.com/pybamm-team/PyBaMM/pull/5371))
@@ -80,6 +69,7 @@ as initial conditions. ([#5311](https://github.com/pybamm-team/PyBaMM/pull/5311)
 
 - Fixed a bug where `fixed_input_parameters` ignored `InputParameter` values within expressions in `ParameterValues`. ([#5321](https://github.com/pybamm-team/PyBaMM/pull/5321))
 - Fixed a bug with domain shape evaluation. ([#5316](https://github.com/pybamm-team/PyBaMM/pull/5316))
+>>>>>>> develop
 - Fixed a bug where `IDAKLUSolver` errors were not raised correctly. ([#5291](https://github.com/pybamm-team/PyBaMM/pull/5291))
 - Fixed a bug in 2D concatenatations for quantities that vary in the `tb` direction ([#5310](https://github.com/pybamm-team/PyBaMM/pull/5310))
 
@@ -91,7 +81,22 @@ as initial conditions. ([#5311](https://github.com/pybamm-team/PyBaMM/pull/5311)
 ## Bug fixes
 
 - Fix a bug with serialising `InputParameter`s. ([#5289](https://github.com/pybamm-team/PyBaMM/pull/5289))
+<<<<<<< HEAD
+=======
+- Fixed a bug with domain shape evaluation. ([#5316](https://github.com/pybamm-team/PyBaMM/pull/5316))
+- Fixed a bug where `IDAKLUSolver` errors were not raised correctly. ([#5291](https://github.com/pybamm-team/PyBaMM/pull/5291))
+- Fixed a bug in 2D concatenatations for quantities that vary in the `tb` direction ([#5310](https://github.com/pybamm-team/PyBaMM/pull/5310))
+
+# [v25.10.2](https://github.com/pybamm-team/PyBaMM/tree/v25.10.2) - 2025-11-27
+
+## Bug fixes
+
+- Fix a bug with serialising `InputParameter`s. ([#5289](https://github.com/pybamm-team/PyBaMM/pull/5289))
 - Fix a bug with missing inputs for `initial_conditions_from` scale evaluation ([#5285](https://github.com/pybamm-team/PyBaMM/pull/5285))
+>>>>>>> refs/remotes/origin/develop
+=======
+- Fix a bug with missing inputs for `initial_conditions_from` scale evaluation ([#5285](https://github.com/pybamm-team/PyBaMM/pull/5285))
+>>>>>>> develop
 
 # [v25.10.1](https://github.com/pybamm-team/PyBaMM/tree/v25.10.1) - 2025-11-14
 
