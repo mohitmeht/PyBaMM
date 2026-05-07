@@ -5,7 +5,7 @@ ci:
 
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: "v0.15.9"
+    rev: "v0.15.12"
     hooks:
       - id: ruff-check
         args: [--fix, --show-fixes]
@@ -23,6 +23,7 @@ repos:
     rev: v6.0.0
     hooks:
         - id: check-added-large-files
+          exclude: "uv\\.lock"
         - id: check-case-conflict
         - id: check-merge-conflict
         - id: check-yaml
@@ -45,6 +46,6 @@ repos:
         - id: sp-repo-review
 
   - repo: https://github.com/woodruffw/zizmor-pre-commit
-    rev: v1.23.1
+    rev: v1.24.1
     hooks:
       - id: zizmor
