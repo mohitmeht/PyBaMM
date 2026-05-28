@@ -15,10 +15,48 @@ from pybamm.codegen.compilation import aot_compile
 
 _UNSET = object()
 
+
+def _flatten_inputs(inputs_dict):
+    """Flatten ``{name: value}`` into a 1-D float array in dict-key order."""
+    if not inputs_dict:
+        return np.zeros(0)
+    return np.concatenate([np.asarray(v).reshape(-1) for v in inputs_dict.values()])
+
+
 # Mirrors SUNDIALS ``IDA_ROOT_RETURN`` in ``sundials/include/ida/ida.h``.
 # Returned by ``IDASolve`` (and surfaced via ``Solution.flag``) when the
 # integrator has located one or more root function zeros.
 _IDA_ROOT_RETURN = 2
+
+# Function entries staged in ``_setup`` while building the C++ solver
+# group; popped after construction (C++ owns them via shared_ptr).
+_SETUP_FCN_KEYS = (
+    "rhs_algebraic",
+    "jac_times_cjmass",
+    "jac_rhs_algebraic_action",
+    "mass_action",
+    "sensfn",
+    "rootfn",
+    "alg_res",
+    "alg_jac",
+)
+_SETUP_FCN_LIST_KEYS = (
+    "var_idaklu_fcns",
+    "dvar_dy_idaklu_fcns",
+    "dvar_dp_idaklu_fcns",
+)
+
+# Attributes holding casadi.Function graphs (or the C++ solver) that are
+# rebuilt from the model on the next solve(). Dropped in __getstate__ so a
+# pickled solver doesn't carry these heavy, non-portable objects.
+_REBUILDABLE_STATE_KEYS = (
+    "_setup",
+    "_model_set_up",
+    "computed_var_fcns",
+    "computed_dvar_dy_fcns",
+    "computed_dvar_dp_fcns",
+    "_time_integral_vars",
+)
 
 
 class IDAKLUSolver(pybamm.BaseSolver):
@@ -51,6 +89,17 @@ class IDAKLUSolver(pybamm.BaseSolver):
     output_variables : list[str], optional
         List of variables to calculate and return. If none are specified then
         the complete state vector is returned (can be very large) (default is [])
+    store_first_last : bool, optional
+        If True, only the first and last sample of each integration window are
+        stored (one experiment step in :meth:`pybamm.Simulation.solve`, or the
+        full ``[t_eval[0], t_eval[-1]]`` window in :meth:`solve`). Intended for
+        memory-light long experiments whose post-processing only reads per-step
+        first/last values. Note: with this flag on, IDAKLU's Hermite
+        interpolation is disabled (see :attr:`options["hermite_interpolation"]`)
+        and any query at a non-endpoint time within a step falls back to linear
+        interpolation across the whole step, so this flag is **not**
+        appropriate when post-processing queries an intra-step time.
+        Default is False.
     options: dict, optional
         Addititional options to pass to the solver, by default:
 
@@ -199,6 +248,7 @@ class IDAKLUSolver(pybamm.BaseSolver):
         output_variables=None,
         on_failure=None,
         options=None,
+        store_first_last=False,
     ):
         self.output_variables = [] if output_variables is None else output_variables
 
@@ -220,6 +270,7 @@ class IDAKLUSolver(pybamm.BaseSolver):
             output_variables=output_variables,
             on_extrapolation=on_extrapolation,
             on_failure=on_failure,
+            store_first_last=store_first_last,
         )
         self.name = "IDA KLU solver"
         self._supports_interp = True
@@ -482,26 +533,22 @@ class IDAKLUSolver(pybamm.BaseSolver):
         # all functions are bundled into a single shared library via one gcc
         # invocation; each serialized Function then points at its entry point.
         has_sens = (len(stacked_inputs) > 0) and model.calculate_sensitivities
-        solver_fn_names = [
-            "rhs_algebraic",
-            "jac_times_cjmass",
-            "jac_rhs_algebraic_action",
-            "mass_action",
-            "sensfn",
-            "rootfn",
-            "alg_res",
-            "alg_jac",
-        ]
-        fns = {
-            "rhs_algebraic": rhs_algebraic,
-            "jac_times_cjmass": jac_times_cjmass,
-            "jac_rhs_algebraic_action": jac_rhs_algebraic_action,
-            "mass_action": mass_action,
-            "sensfn": sensfn,
-            "rootfn": rootfn,
-            "alg_res": alg_res_fn,
-            "alg_jac": jac_alg_fn,
-        }
+        fns = dict(
+            zip(
+                _SETUP_FCN_KEYS,
+                (
+                    rhs_algebraic,
+                    jac_times_cjmass,
+                    jac_rhs_algebraic_action,
+                    mass_action,
+                    sensfn,
+                    rootfn,
+                    alg_res_fn,
+                    jac_alg_fn,
+                ),
+                strict=True,
+            )
+        )
         for key in self.output_variables:
             fns[f"var:{key}"] = self.computed_var_fcns[key]
             if has_sens:
@@ -512,10 +559,8 @@ class IDAKLUSolver(pybamm.BaseSolver):
             compiled = aot_compile(list(fns.values()))
             fns = dict(zip(fns.keys(), compiled, strict=True))
 
-        # Build _setup dict with serialized functions for idaklu C++ wrapper
         def to_idaklu(fn):
-            pkl = fn.serialize()
-            return idaklu.generate_function(pkl), pkl
+            return idaklu.generate_function(fn.serialize())
 
         self._setup = {
             "number_of_states": len(y0),
@@ -534,35 +579,27 @@ class IDAKLUSolver(pybamm.BaseSolver):
             "output_variables": self.output_variables,
             "var_fcns": self.computed_var_fcns,
             "var_idaklu_fcns": [],
-            "var_idaklu_fcns_pkl": [],
             "dvar_dy_idaklu_fcns": [],
-            "dvar_dy_idaklu_fcns_pkl": [],
             "dvar_dp_idaklu_fcns": [],
-            "dvar_dp_idaklu_fcns_pkl": [],
         }
 
-        for name in solver_fn_names:
-            fn, pkl = to_idaklu(fns[name])
-            self._setup[name] = fn
-            self._setup[f"{name}_pkl"] = pkl
+        for name in _SETUP_FCN_KEYS:
+            self._setup[name] = to_idaklu(fns[name])
+
+        # The idaklu-bound Function isn't callable from Python; keep the
+        # original for the closest_event_idx lookup in _post_process_solution.
+        self._setup["rootfn_casadi"] = fns["rootfn"]
 
         for key in self.output_variables:
-            fn, pkl = to_idaklu(fns[f"var:{key}"])
-            self._setup["var_idaklu_fcns"].append(fn)
-            self._setup["var_idaklu_fcns_pkl"].append(pkl)
+            self._setup["var_idaklu_fcns"].append(to_idaklu(fns[f"var:{key}"]))
             if has_sens:
-                fn, pkl = to_idaklu(fns[f"dvar_dy:{key}"])
-                self._setup["dvar_dy_idaklu_fcns"].append(fn)
-                self._setup["dvar_dy_idaklu_fcns_pkl"].append(pkl)
-                fn, pkl = to_idaklu(fns[f"dvar_dp:{key}"])
-                self._setup["dvar_dp_idaklu_fcns"].append(fn)
-                self._setup["dvar_dp_idaklu_fcns_pkl"].append(pkl)
+                self._setup["dvar_dy_idaklu_fcns"].append(
+                    to_idaklu(fns[f"dvar_dy:{key}"])
+                )
+                self._setup["dvar_dp_idaklu_fcns"].append(
+                    to_idaklu(fns[f"dvar_dp:{key}"])
+                )
 
-        self._create_solver()
-        return base_set_up_return
-
-    def _create_solver(self):
-        """Create the idaklu solver group from _setup. Used by set_up and __setstate__."""
         self._setup["solver"] = idaklu.create_casadi_solver_group(
             number_of_states=self._setup["number_of_states"],
             number_of_parameters=self._setup["number_of_sensitivity_parameters"],
@@ -590,53 +627,36 @@ class IDAKLUSolver(pybamm.BaseSolver):
             alg_jac=self._setup["alg_jac"],
         )
 
-    def __getstate__(self):
-        # if _setup is not defined then we haven't called set_up yet
-        if not hasattr(self, "_setup"):
-            return self.__dict__
-
-        for key in [
-            "solver",
-            "rhs_algebraic",
-            "jac_times_cjmass",
-            "jac_rhs_algebraic_action",
-            "mass_action",
-            "sensfn",
-            "rootfn",
-            "var_idaklu_fcns",
-            "dvar_dy_idaklu_fcns",
-            "dvar_dp_idaklu_fcns",
-            "alg_res",
-            "alg_jac",
-        ]:
+        # C++ solver group now owns each casadi::Function via shared_ptr;
+        # drop the Python references. rootfn_casadi stays for runtime use.
+        for key in (*_SETUP_FCN_KEYS, *_SETUP_FCN_LIST_KEYS):
             self._setup.pop(key, None)
-        return self.__dict__
+
+        # Release the public casadi.Function caches now that the C++ group
+        # owns the functions. _setup["var_fcns"] keeps the references that
+        # _post_process_solution still needs; the dvar caches are unused
+        # after setup, so dropping them frees that memory immediately.
+        self.computed_var_fcns = {}
+        self.computed_dvar_dy_fcns = {}
+        self.computed_dvar_dp_fcns = {}
+
+        return base_set_up_return
+
+    def __getstate__(self):
+        # Drop the rebuildable state (C++ solver + casadi.Function graphs)
+        # so the next solve() rebuilds from the model rather than shipping
+        # serialised functions in the pickle.
+        state = self.__dict__.copy()
+        for key in _REBUILDABLE_STATE_KEYS:
+            state.pop(key, None)
+        return state
 
     def __setstate__(self, d):
         self.__dict__.update(d)
-
-        # if _setup is not defined then we haven't called set_up yet
-        if not hasattr(self, "_setup"):
-            return
-
-        for key in [
-            "rhs_algebraic",
-            "jac_times_cjmass",
-            "jac_rhs_algebraic_action",
-            "mass_action",
-            "sensfn",
-            "rootfn",
-            "alg_res",
-            "alg_jac",
-        ]:
-            self._setup[key] = idaklu.generate_function(self._setup[f"{key}_pkl"])
-
-        for key in ["var_idaklu_fcns", "dvar_dy_idaklu_fcns", "dvar_dp_idaklu_fcns"]:
-            self._setup[key] = [
-                idaklu.generate_function(f) for f in self._setup[f"{key}_pkl"]
-            ]
-
-        self._create_solver()
+        # Restore the empty defaults BaseSolver.__init__ would set, so the
+        # solver reads as "not yet set up" until the next solve().
+        self._model_set_up = {}
+        self.computed_var_fcns = {}
 
     @property
     def options(self):
@@ -660,12 +680,7 @@ class IDAKLUSolver(pybamm.BaseSolver):
 
         # stack inputs so that they are a 2D array of shape (number_of_inputs, number_of_parameters)
         if inputs_list and inputs_list[0]:
-            inputs = np.vstack(
-                [
-                    np.hstack([np.array(x).reshape(-1) for x in inputs_dict.values()])
-                    for inputs_dict in inputs_list
-                ]
-            )
+            inputs = np.vstack([_flatten_inputs(d) for d in inputs_list])
         else:
             inputs = np.array([[]] * len(inputs_list))
 
@@ -805,6 +820,18 @@ class IDAKLUSolver(pybamm.BaseSolver):
             variables_returned=bool(save_outputs_only),
             options=solution_options,
         )
+
+        # Set closest_event_idx so BaseSolver.get_termination_reason doesn't
+        # re-walk every event's symbolic expression on the Python side.
+        if sol.flag == _IDA_ROOT_RETURN and self._setup["num_of_events"] > 0:
+            event_values = np.asarray(
+                self._setup["rootfn_casadi"](
+                    float(sol.t[-1]),
+                    np.asarray(y_event).reshape(-1),
+                    _flatten_inputs(inputs_dict),
+                )
+            ).reshape(-1)
+            newsol.closest_event_idx = int(np.nanargmin(np.abs(event_values)))
 
         newsol.integration_time = integration_time
         if not save_outputs_only:

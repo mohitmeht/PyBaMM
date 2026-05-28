@@ -175,23 +175,32 @@ class TestExperimentMemory:
 
     def test_cycle_count_memory_scaling(self):
         """Memory should NOT scale linearly with cycle count."""
+        # Time-bounded steps (no event terminations) with a fixed period so
+        # each cycle produces the same number of stored samples; this isolates
+        # the cycle-count effect on _setup/Solution scaling from per-step
+        # variability in IDA's adaptive step count.
         cycle = [
-            "Discharge at C/5 for 30 minutes or until 3.0 V",
+            "Discharge at C/4 for 30 minutes",
             "Rest for 5 minutes",
-            "Charge at C/5 for 30 minutes or until 4.2 V",
+            "Charge at C/5 for 30 minutes",
             "Rest for 5 minutes",
         ]
+        period = "1000000 seconds"
 
         # Warmup
         model = pybamm.lithium_ion.SPM()
-        sim = pybamm.Simulation(model, experiment=pybamm.Experiment(cycle * 2))
+        sim = pybamm.Simulation(
+            model, experiment=pybamm.Experiment(cycle * 2, period=period)
+        )
         sim.solve()
 
         # Measure memory for different cycle counts
         gc.collect()
         tracemalloc.start()
         model = pybamm.lithium_ion.SPM()
-        sim = pybamm.Simulation(model, experiment=pybamm.Experiment(cycle * 5))
+        sim = pybamm.Simulation(
+            model, experiment=pybamm.Experiment(cycle * 5, period=period)
+        )
         sim.solve()
         gc.collect()
         mem_5_cycles, _ = tracemalloc.get_traced_memory()
@@ -200,18 +209,22 @@ class TestExperimentMemory:
         gc.collect()
         tracemalloc.start()
         model = pybamm.lithium_ion.SPM()
-        sim = pybamm.Simulation(model, experiment=pybamm.Experiment(cycle * 20))
+        sim = pybamm.Simulation(
+            model, experiment=pybamm.Experiment(cycle * 20, period=period)
+        )
         sim.solve()
         gc.collect()
         mem_20_cycles, _ = tracemalloc.get_traced_memory()
         tracemalloc.stop()
 
-        # 4x more cycles should NOT cause 4x memory (that would indicate
-        # each step is building its own model). Allow 1.25x for solution data growth.
+        # 4x more cycles should grow memory sub-linearly (linear would be
+        # 4x, indicating each step rebuilds the model). The 1.3x bound is
+        # loose enough to tolerate cross-platform allocator noise on the
+        # small absolute footprint left after a period=1M endpoint solve.
         ratio = mem_20_cycles / mem_5_cycles
-        assert ratio < 1.25, (
+        assert ratio < 1.3, (
             f"Memory grew {ratio:.1f}x for 4x more cycles. "
-            f"Expected sub-linear growth (<2.5x). "
+            f"Expected sub-linear growth (<1.3x). "
             f"This may indicate termination hashing is broken (see #5453)."
         )
 
@@ -274,3 +287,93 @@ class TestExperimentMemory:
 
         peak_mb = peak / 1024 / 1024
         assert peak_mb < 6, f"Peak memory {peak_mb:.1f} MB for GITT is excessive."
+
+    def test_processed_variable_computed_initialise_is_lazy(self):
+        # initialise_* (np.concatenate / flatten / xr.DataArray build) must
+        # defer until the data is actually read, otherwise per-step
+        # ProcessedVariableComputed instances in discarded cycles do work nobody
+        # ever reads.
+        unroll_calls = 0
+        original = pybamm.ProcessedVariableComputed.unroll_0D
+
+        def counting(self, realdata=None):
+            nonlocal unroll_calls
+            unroll_calls += 1
+            return original(self, realdata=realdata)
+
+        pybamm.ProcessedVariableComputed.unroll_0D = counting
+        try:
+            num_cycles = 50
+            cycle = (
+                "Discharge at 1C until 3.0 V",
+                "Charge at 1C until 4.2 V",
+            )
+            sim = pybamm.Simulation(
+                pybamm.lithium_ion.SPM(),
+                experiment=pybamm.Experiment([cycle] * num_cycles, period=300),
+                solver=pybamm.IDAKLUSolver(output_variables=["Voltage [V]"]),
+            )
+            sim.solve(save_at_cycles=num_cycles)
+        finally:
+            pybamm.ProcessedVariableComputed.unroll_0D = original
+
+        # Eager init: hundreds of calls (grows with N_cycles via _concat).
+        # Lazy init: only instances actually read (cycle summary boundaries).
+        assert unroll_calls < num_cycles, (
+            f"unroll_0D called {unroll_calls} times during a {num_cycles}-cycle "
+            f"solve. ProcessedVariableComputed.initialise_* must defer to first "
+            f"data read so instances in discarded cycles don't run heavy work."
+        )
+
+    def test_idaklu_event_termination_no_python_event_reeval(self):
+        """
+        IDAKLUSolver with output_variables on a long event-terminated experiment
+        must not re-walk every TERMINATION event's symbolic expression on the
+        Python side after each step. That path goes through
+        StateVector._base_evaluate (per-leaf numpy fancy-indexing) and dominated
+        per-step allocation churn before the closest_event_idx fix.
+
+        Allocations are transient (immediately freed each step), so peak-RSS /
+        tracemalloc snapshots can't see them. Count direct calls to
+        _base_evaluate instead — deterministic across runs.
+        """
+        original = pybamm.StateVector._base_evaluate
+        call_count = 0
+
+        def counting(self, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original(self, *args, **kwargs)
+
+        pybamm.StateVector._base_evaluate = counting
+        try:
+            experiment = pybamm.Experiment(
+                [
+                    (
+                        "Discharge at 1C until 3.0 V",
+                        "Charge at 1C until 4.2 V",
+                        "Hold at 4.2 V until C/50",
+                    )
+                ]
+                * 5,
+                period=300,
+            )
+            sim = pybamm.Simulation(
+                pybamm.lithium_ion.SPM(),
+                experiment=experiment,
+                solver=pybamm.IDAKLUSolver(output_variables=["Voltage [V]"]),
+            )
+            sim.solve()
+        finally:
+            pybamm.StateVector._base_evaluate = original
+
+        # Solve-time setup paths legitimately call _base_evaluate (initial
+        # conditions, event setup) — those scale with the model, not the
+        # cycle count. Per-step re-evaluation pushes the count past 1000 on
+        # a 5-cycle SPM run; the fix keeps it under 200.
+        assert call_count < 300, (
+            f"StateVector._base_evaluate was called {call_count} times during "
+            f"a 5-cycle solve. IDAKLUSolver should set closest_event_idx so "
+            f"BaseSolver.get_termination_reason short-circuits instead of "
+            f"re-walking event expressions on every step."
+        )

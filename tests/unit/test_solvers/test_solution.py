@@ -4,6 +4,8 @@
 import io
 import json
 import logging
+import subprocess  # nosec B404 - used in tests with trusted input
+import sys
 
 import numpy as np
 import pandas as pd
@@ -28,6 +30,39 @@ class TestSolution:
         assert sol.termination == "final time"
         assert sol.all_inputs == [{}]
         assert isinstance(sol.all_models[0], pybamm.BaseModel)
+
+    def test_sub_solutions_no_self_ref_cycle(self):
+        # A fresh Solution must not appear in its own _sub_solutions list,
+        # otherwise the resulting refcount cycle would keep large solutions
+        # alive past their last strong reference.
+        import weakref
+
+        sol = pybamm.Solution(
+            np.linspace(0, 1),
+            np.tile(np.linspace(0, 1), (2, 1)),
+            pybamm.BaseModel(),
+            {},
+        )
+        assert sol._sub_solutions == []
+        # Property still exposes [self] so downstream consumers see the
+        # current solution as its own single sub-solution.
+        assert sol.sub_solutions == [sol]
+
+        # Refcount alone (no gc) must reap the solution.
+        ref = weakref.ref(sol)
+        del sol
+        assert ref() is None
+
+    def test_sub_solutions_concat_after_add(self):
+        # __add__ must record both operands as sub-solutions (the
+        # property's empty-list fallback to [self] is what makes this work
+        # even though neither operand stored itself).
+        t = np.linspace(0, 1)
+        y = np.tile(t, (2, 1))
+        a = pybamm.Solution(t, y, pybamm.BaseModel(), {})
+        b = pybamm.Solution(t + 1, y, pybamm.BaseModel(), {})
+        c = a + b
+        assert c.sub_solutions == [a, b]
 
     def test_yp(self):
         t = np.linspace(0, 1)
@@ -688,6 +723,53 @@ class TestSolution:
         np.testing.assert_array_equal(
             data["Step"], np.concatenate([np.zeros(50), np.ones(50)])
         )
+
+    def test_pickle_first_states_across_processes(self, tmp_path):
+        # Regression test for #5444: a Solution pickled in one process and
+        # unpickled in another (different PYTHONHASHSEED) must still allow
+        # access to variables in `all_first_states`. The bug was that
+        # Symbol._id is computed via hash() of strings, which is randomised
+        # per process; after unpickle the cached _id was inconsistent with
+        # the current process's hash, breaking Discretisation.y_slices
+        # lookups for any variable not already cached in
+        # model._variables_processed.
+        pkl = tmp_path / "sol.pkl"
+        # repr() so Windows backslashes survive being parsed as a Python literal
+        pkl_literal = repr(str(pkl))
+        observe = (
+            'v = src.all_first_states[0]["Discharge capacity [A.h]"]\n'
+            'print("DATA", repr(v.data.tolist()))\n'
+        )
+        save_code = (
+            "import pybamm\n"
+            "sim = pybamm.Simulation(\n"
+            "    pybamm.lithium_ion.SPM(),\n"
+            "    experiment=pybamm.Experiment(\n"
+            '        ["Discharge at 1C for 1 minute", "Rest for 1 minute"]\n'
+            "    ),\n"
+            ")\n"
+            "sim.solve()\n"
+            f"sim.solution.save({pkl_literal})\n"
+            "src = sim.solution\n" + observe
+        )
+        load_code = f"import pybamm\nsrc = pybamm.load({pkl_literal})\n" + observe
+        # nosec B603 - sys.executable + literal code constructed in this test
+        save_result = subprocess.run(  # nosec B603
+            [sys.executable, "-c", save_code],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        load_result = subprocess.run(  # nosec B603
+            [sys.executable, "-c", load_code],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # The variable resolves identically in the saving process and in a
+        # fresh process loading the pickle.
+        assert "DATA" in save_result.stdout
+        assert save_result.stdout == load_result.stdout
 
     def test_solution_evals_with_inputs(self):
         model = pybamm.lithium_ion.SPM()
