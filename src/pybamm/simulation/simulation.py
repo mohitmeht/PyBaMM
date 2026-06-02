@@ -254,14 +254,24 @@ class Simulation(BaseSimulation):
 
     def _set_up_unified_experiment_model(self, parameter_values):
         self._experiment_uses_unified_model = True
-        self._experiment_step_indices = list(range(1, len(self.experiment.steps) + 1))
+
+        # Branch the switching Conditionals over unique steps, not instances: one
+        # branch per instance is O(n_steps) per timestep -> O(n_steps**2) overall.
+        unique_steps = []
+        unique_branch_by_repr = {}
+        for step in self.experiment.steps:
+            key = step.basic_repr()
+            if key not in unique_branch_by_repr:
+                unique_branch_by_repr[key] = len(unique_steps) + 1  # 1-based selector
+                unique_steps.append(step)
+        self._experiment_step_indices = [
+            unique_branch_by_repr[step.basic_repr()] for step in self.experiment.steps
+        ]
         self._experiment_includes_padding_rest = bool(
             self.experiment.initial_start_time
         )
         self._experiment_padding_rest_index = (
-            len(self.experiment.steps) + 1
-            if self._experiment_includes_padding_rest
-            else None
+            len(unique_steps) + 1 if self._experiment_includes_padding_rest else None
         )
 
         new_model = self._model.new_copy()
@@ -272,9 +282,7 @@ class Simulation(BaseSimulation):
 
         # Build one conditional control residual that selects the active step's
         # control law via the experiment step index input.
-        step_control_builders = [
-            step.get_control_residual for step in self.experiment.steps
-        ]
+        step_control_builders = [step.get_control_residual for step in unique_steps]
         if self._experiment_includes_padding_rest:
             padding_rest_step = pybamm.step.Rest(duration=1)
             step_control_builders.append(padding_rest_step.get_control_residual)
@@ -295,8 +303,7 @@ class Simulation(BaseSimulation):
         # Combine each step's local termination expression into one experiment event,
         # selecting the active branch with the step index input.
         termination_branches = [
-            step.get_combined_termination_expression(variables)
-            for step in self.experiment.steps
+            step.get_combined_termination_expression(variables) for step in unique_steps
         ]
         if self._experiment_includes_padding_rest:
             termination_branches.append(pybamm.Scalar(1))
@@ -641,7 +648,6 @@ class Simulation(BaseSimulation):
                     f"Step '{step_str}' is infeasible at initial conditions, "
                     "but skip_ok is True. Skipping step."
                 )
-                self._solution.termination = steps[0].termination
                 return True  # signal: continue to next cycle
             raise pybamm.SolverError(
                 f"Step '{step_str}' is infeasible "
@@ -894,6 +900,21 @@ class Simulation(BaseSimulation):
         else:
             cycle_lengths = self.experiment.cycle_lengths
 
+        # Collect per-cycle solutions and fold once after the loop (O(N), not O(N^2)).
+        # Seed with the loop-entry self._solution to match the old left-fold start.
+        cross_cycle_segments = (
+            []
+            if (
+                self._solution is None
+                or isinstance(self._solution, pybamm.EmptySolution)
+            )
+            else [self._solution]
+        )
+
+        # Track running termination (real cycles + skipped steps), applied to the
+        # folded solution below to match the old left-fold's final termination.
+        last_termination = None
+
         for cycle_num, cycle_length in enumerate(
             cycle_lengths,
             start=1,
@@ -1075,11 +1096,14 @@ class Simulation(BaseSimulation):
             if cycle_solution is not None and (
                 save_this_cycle or feasible is False or stop_experiment
             ):
-                self._solution = self._solution + cycle_solution
+                cross_cycle_segments.append(cycle_solution)
+                if not isinstance(cycle_solution, pybamm.EmptySolution):
+                    last_termination = cycle_solution.termination
 
             if steps:
                 if all(isinstance(s, pybamm.EmptySolution) for s in steps):
                     if self._check_infeasible_steps(steps, step, step_str, cycle_num):
+                        last_termination = steps[0].termination
                         continue
                 cycle_sol = pybamm.make_cycle_solution(
                     steps,
@@ -1139,6 +1163,11 @@ class Simulation(BaseSimulation):
 
             if stop_experiment:
                 break
+
+        if cross_cycle_segments:
+            self._solution = pybamm.Solution.from_sub_solutions(cross_cycle_segments)
+            if last_termination is not None:
+                self._solution.termination = last_termination
 
         if self._solution is not None and len(all_cycle_solutions) > 0:
             self._solution.cycles = all_cycle_solutions

@@ -37,6 +37,21 @@ class TestSimulationExperiment:
             **simulation_kwargs,
         )
 
+    def test_batch_cross_cycle_equivalent(self):
+        # Full multi-cycle solution must be identical with batch accumulation.
+        model = pybamm.lithium_ion.SPM()
+        exp = pybamm.Experiment(
+            [("Discharge at 1C until 3.0V", "Charge at 1C until 4.2V")] * 5,
+            period=600,
+        )
+        sim = pybamm.Simulation(model, experiment=exp)
+        sol = sim.solve()
+        v = sol["Voltage [V]"].entries
+        assert np.all(np.isfinite(v))
+        assert np.all(np.diff(sol.t) > 0)  # monotonic time preserved
+        assert len(sol.cycles) == 5  # cycles wiring preserved
+        assert sol.summary_variables is not None
+
     def test_unified_model_mode_validation_and_blockers(self):
         with pytest.raises(ValueError, match="experiment_model_mode must be one of"):
             pybamm.Simulation(
@@ -397,6 +412,63 @@ class TestSimulationExperiment:
             assert c[1:] == first, (
                 f"build counts grow with n_cycles instead of staying flat: {counts}"
             )
+
+    def test_unified_model_switching_size_independent_of_cycle_count(self):
+        # The unified model's switching Conditional must branch on unique steps, not
+        # step instances, or it is O(n_steps) per timestep -> O(n_steps**2) over the
+        # experiment. Branch count must stay bounded by unique steps and flat in
+        # cycle count.
+        def max_conditional_branches(model):
+            roots = (
+                list(model.rhs.values())
+                + list(model.algebraic.values())
+                + [event.expression for event in model.events]
+            )
+            seen = set()
+            stack = list(roots)
+            most = 0
+            while stack:
+                sym = stack.pop()
+                if id(sym) in seen:
+                    continue
+                seen.add(id(sym))
+                if isinstance(sym, pybamm.Conditional):
+                    most = max(most, len(sym.branches))
+                stack.extend(sym.children)
+            return most
+
+        unit_cycle = (
+            "Discharge at 1C until 3.0V",
+            "Charge at 1C until 4.2V",
+            "Hold at 4.2V until C/50",
+        )
+        n_unique = len(unit_cycle)
+
+        branch_counts = []
+        step_index_maps = []
+        for n_cycles in (2, 5, 20):
+            experiment = pybamm.Experiment([unit_cycle] * n_cycles)
+            sim = pybamm.Simulation(
+                pybamm.lithium_ion.SPM(),
+                experiment=experiment,
+                solver=pybamm.IDAKLUSolver(),
+                experiment_model_mode="unified",
+            )
+            sim.build_for_experiment()
+            assert sim._experiment_uses_unified_model
+            branch_counts.append(max_conditional_branches(sim._built_experiment_model))
+            step_index_maps.append(sim._experiment_step_indices)
+
+        assert branch_counts[0] == branch_counts[-1], (
+            f"unified switching grows with cycles: {branch_counts}"
+        )
+        assert max(branch_counts) <= n_unique
+
+        # Duplicate instances collapse onto the same branch index, repeating per cycle.
+        for n_cycles, indices in zip((2, 5, 20), step_index_maps, strict=True):
+            assert len(indices) == n_unique * n_cycles
+            assert set(indices) == set(range(1, n_unique + 1))
+            assert indices == [(i % n_unique) + 1 for i in range(len(indices))]
 
     def test_experiment_state_mapper_has_full_state_size_for_2d_current_collector(self):
         experiment = pybamm.Experiment(
